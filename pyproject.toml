@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tradingbot"
+version = "2.0.0"
+description = "Technical-indicator trading bot for Alpaca paper trading"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Hamza Kashubeck" }]
+# Pinned for reproducibility. TA-Lib wraps a C library; see README.
+dependencies = [
+    "alpaca-py==0.44.0",
+    "numpy==2.2.6",
+    "pandas==2.3.3",
+    "python-dotenv==1.2.4",
+    "requests==2.34.2",
+    "TA-Lib==0.8.2",
+]
+
+[project.scripts]
+tradingbot = "tradingbot.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
