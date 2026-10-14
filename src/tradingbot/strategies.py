@@ -1,9 +1,6 @@
-"""Indicators and strategies: when to trade.
-
-This module never touches the network. A strategy takes a MarketSnapshot (candles
-plus the latest price) and returns BUY, SELL or HOLD, so the same code runs live
-or against historical candles in a backtest.
-"""
+"""Indicators and strategies. A strategy looks at recent candles and returns BUY,
+SELL or HOLD. Nothing in here touches the network, so the same code works live and
+in the backtester."""
 
 from __future__ import annotations
 
@@ -38,12 +35,9 @@ class MarketSnapshot:
     ask: float
 
 
-# ---------------------------------------------------------------- indicators
-#
-# Each returns the value for the most recent candle, computed over the full candle
-# history. Values are NaN when there are too few candles; every comparison against
-# NaN is False, so strategies fall through to HOLD. All TA-Lib parameters are passed
-# explicitly because its defaults have changed between releases.
+# Indicators. Each one returns its latest value, or NaN if there isn't enough data
+# yet (any comparison with NaN is False, so the strategies just return HOLD).
+# TA-Lib parameters are spelled out because some defaults changed between versions.
 
 
 def _col(candles: pd.DataFrame, name: str) -> np.ndarray:
@@ -89,13 +83,12 @@ def adx(candles: pd.DataFrame, period: int = 14) -> tuple[float, float, float]:
     )
 
 
-# ---------------------------------------------------------------- strategies
+# Strategies
 
 
 class Strategy(ABC):
-    """evaluate() must return immediately. A strategy that needs to wait for
-    something (e.g. an indicator to rebound) keeps that as state between calls
-    and returns HOLD until it is ready; the caller owns the waiting."""
+    """evaluate() should return right away. If a strategy needs to wait for something,
+    it remembers that between calls and returns HOLD in the meantime."""
 
     @abstractmethod
     def evaluate(self, snapshot: MarketSnapshot) -> Signal: ...

@@ -21,6 +21,7 @@ dependencies = [
 
 [project.scripts]
 tradingbot = "tradingbot.main:main"
+tradingbot-backtest = "tradingbot.backtest:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

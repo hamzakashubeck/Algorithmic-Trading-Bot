@@ -1,4 +1,4 @@
-"""Everything that talks to Alpaca: market data (MarketData) and orders (Broker)."""
+"""Everything that talks to Alpaca: market data (MarketData) and orders (AlpacaBroker)."""
 
 from __future__ import annotations
 
@@ -7,18 +7,14 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
+from alpaca.common.exceptions import APIError
 from alpaca.data.enums import DataFeed
-from alpaca.data.historical import CryptoHistoricalDataClient, StockHistoricalDataClient
-from alpaca.data.requests import (
-    CryptoBarsRequest,
-    CryptoSnapshotRequest,
-    StockBarsRequest,
-    StockSnapshotRequest,
-)
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest, StockSnapshotRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, OrderStatus, QueryOrderStatus, TimeInForce
-from alpaca.trading.models import Order
+from alpaca.trading.models import Clock, Order
 from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest, MarketOrderRequest
 
 from tradingbot.config import Settings
@@ -27,6 +23,9 @@ from tradingbot.strategies import MarketSnapshot
 log = logging.getLogger(__name__)
 
 CANDLE_COLUMNS = ["open", "high", "low", "close", "volume"]
+
+# How much candle history the indicators get (the backtester uses this too)
+LOOKBACK = timedelta(days=3)
 
 TERMINAL_STATUSES = {
     OrderStatus.FILLED,
@@ -37,47 +36,38 @@ TERMINAL_STATUSES = {
 }
 
 
-def is_crypto(symbol: str) -> bool:
-    """Alpaca crypto pairs are written with a slash, e.g. BTC/USD."""
-    return "/" in symbol
-
-
-# ---------------------------------------------------------------- market data
+# Market data
 
 
 class MarketData:
-    def __init__(self, settings: Settings, lookback: timedelta = timedelta(days=3)) -> None:
+    def __init__(self, settings: Settings, lookback: timedelta = LOOKBACK) -> None:
         self._stocks = StockHistoricalDataClient(settings.api_key, settings.secret_key)
-        self._crypto = CryptoHistoricalDataClient(settings.api_key, settings.secret_key)
         self._feed = DataFeed(settings.data_feed)
         self._lookback = lookback
 
+    def candles(self, symbol: str, start: datetime, end: datetime | None = None) -> pd.DataFrame:
+        """1-minute OHLCV candles between start and end (default: now), oldest first."""
+        bars = self._stocks.get_stock_bars(
+            StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=TimeFrame.Minute,
+                start=start,
+                end=end,
+                feed=self._feed,
+            )
+        )
+        return _to_candles(bars.df)
+
     def snapshot(self, symbol: str) -> MarketSnapshot:
-        """Fetch candles and the latest trade/quote for one symbol (two API calls)."""
-        start = datetime.now(timezone.utc) - self._lookback
-        if is_crypto(symbol):
-            bars = self._crypto.get_crypto_bars(
-                CryptoBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Minute, start=start)
-            )
-            snap = self._crypto.get_crypto_snapshot(
-                CryptoSnapshotRequest(symbol_or_symbols=symbol)
-            )[symbol]
-        else:
-            bars = self._stocks.get_stock_bars(
-                StockBarsRequest(
-                    symbol_or_symbols=symbol,
-                    timeframe=TimeFrame.Minute,
-                    start=start,
-                    feed=self._feed,
-                )
-            )
-            snap = self._stocks.get_stock_snapshot(
-                StockSnapshotRequest(symbol_or_symbols=symbol, feed=self._feed)
-            )[symbol]
+        """Fetch candles and the latest trade/quote for one symbol"""
+        candles = self.candles(symbol, start=datetime.now(timezone.utc) - self._lookback)
+        snap = self._stocks.get_stock_snapshot(
+            StockSnapshotRequest(symbol_or_symbols=symbol, feed=self._feed)
+        )[symbol]
 
         return MarketSnapshot(
             symbol=symbol,
-            candles=_to_candles(bars.df),
+            candles=candles,
             last_price=float(snap.latest_trade.price),
             bid=float(snap.latest_quote.bid_price),
             ask=float(snap.latest_quote.ask_price),
@@ -93,15 +83,10 @@ def _to_candles(df: pd.DataFrame) -> pd.DataFrame:
     return df[CANDLE_COLUMNS].astype(float).sort_index()
 
 
-# ---------------------------------------------------------------- orders
+# Orders
 
 
-def default_time_in_force(symbol: str) -> TimeInForce:
-    # Alpaca rejects DAY orders for crypto; DAY is what the old SDK defaulted to for stocks.
-    return TimeInForce.GTC if is_crypto(symbol) else TimeInForce.DAY
-
-
-class Broker:
+class AlpacaBroker:
     def __init__(self, settings: Settings) -> None:
         self._client = TradingClient(
             settings.api_key,
@@ -110,13 +95,17 @@ class Broker:
             url_override=settings.base_url,
         )
 
+    def clock(self) -> Clock:
+        """Use Alpaca's market clock"""
+        return self._client.get_clock()
+
     def market_order(self, symbol: str, qty: float, side: OrderSide) -> Order:
         order = self._client.submit_order(
             MarketOrderRequest(
                 symbol=symbol,
                 qty=qty,
                 side=side,
-                time_in_force=default_time_in_force(symbol),
+                time_in_force=TimeInForce.DAY,
             )
         )
         log.info("Submitted market %s %s x%s (id=%s)", side.value, symbol, qty, order.id)
@@ -130,7 +119,7 @@ class Broker:
         limit_price: float,
         time_in_force: TimeInForce | None = None,
     ) -> Order:
-        tif = time_in_force or default_time_in_force(symbol)
+        tif = time_in_force or TimeInForce.DAY  # the old SDK's default
         order = self._client.submit_order(
             LimitOrderRequest(
                 symbol=symbol,
@@ -147,7 +136,7 @@ class Broker:
         return order
 
     def wait_for_order(self, order_id: str, timeout: float = 5.0, poll: float = 0.5) -> Order:
-        """Poll until the order reaches a terminal status or the timeout passes."""
+        """Check the order every half second until it's done, for up to `timeout` seconds."""
         deadline = time.monotonic() + timeout
         order = self._client.get_order_by_id(order_id)
         while order.status not in TERMINAL_STATUSES and time.monotonic() < deadline:
@@ -156,16 +145,29 @@ class Broker:
         return order
 
     def cancel_open_orders(self, symbol: str) -> None:
-        """Cancel this bot's open orders only, not every order on the account."""
-        open_orders = self._client.get_orders(
-            GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
-        )
-        for order in open_orders:
+        """Cancel this bot's open orders only"""
+        for order in self._open_orders(symbol):
             self._client.cancel_order_by_id(order.id)
             log.debug("Canceled order %s", order.id)
 
+    def has_open_orders(self, symbol: str) -> bool:
+        return bool(self._open_orders(symbol))
+
+    def position_qty(self, symbol: str) -> float:
+        """How many shares are held."""
+        try:
+            return float(self._client.get_open_position(symbol).qty)
+        except APIError as e:
+            if e.status_code == 404:  # Alpaca's answer for "no position"
+                return 0.0
+            raise
+
+    def _open_orders(self, symbol: str) -> list[Order]:
+        return self._client.get_orders(
+            GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
+        )
+
     def close_position(self, symbol: str) -> Order:
-        # Positions are keyed without the slash (BTC/USD -> BTCUSD).
-        order = self._client.close_position(symbol.replace("/", ""))
+        order = self._client.close_position(symbol)
         log.info("Closing position in %s (id=%s)", symbol, order.id)
         return order

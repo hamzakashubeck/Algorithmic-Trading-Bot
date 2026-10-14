@@ -1,6 +1,6 @@
 # TradingBot
 
-A small algorithmic trading bot that paper-trades one stock, ETF or crypto pair on
+A small algorithmic trading bot that paper-trades one stock or ETF on
 [Alpaca](https://alpaca.markets/). Every few seconds it pulls recent 1-minute candles
 from Alpaca's market data API, computes a technical indicator with
 [TA-Lib](https://ta-lib.org/), turns it into a BUY / SELL / HOLD signal, and places
@@ -9,8 +9,9 @@ orders according to a chosen execution policy.
 > This is a cleaned-up version of a project I wrote in 2022. The original three
 > scripts are preserved at the [`v1` tag](https://github.com/hamzakashubeck/TradingBot/tree/v1).
 
-No performance claims: nothing about the strategies' returns has been measured
-yet. A backtester is the next item on the roadmap.
+It also has a backtester that runs the same strategies over historical data. I'm
+not claiming any of these strategies make money; the backtester is there to find out
+how they actually behave.
 
 ## Strategies
 
@@ -24,13 +25,15 @@ yet. A backtester is the next item on the roadmap.
 
 ## Execution policies
 
-Strategies only decide *when* to trade. The execution policy decides *how*:
+Strategies only decide *when* to trade. The execution policy decides *how*. All of
+them are long-only and position-aware: a BUY only opens a position when the bot holds
+nothing, and a SELL exits whatever it holds.
 
 | Name | Behaviour |
 |---|---|
-| `limit-follow` | Default for stocks. Each cycle, cancels this symbol's unfilled orders; on a new signal, places a limit order just past the ask/bid |
-| `scalp` | Stocks only. Fill-or-kill entry at the ask (or bid) plus 0.05% slippage allowance; if it fills, places a take-profit limit order 0.2% away |
-| `market-follow` | Default for crypto. Market-buys on a new BUY; closes the position on a new SELL |
+| `limit-follow` | Default. Each cycle, cancels this symbol's unfilled orders, then buys (or sells everything) with a limit order just past the ask/bid |
+| `scalp` | Fill-or-kill buy at the ask plus a 0.05% slippage allowance; if it fills, places a take-profit sell 0.2% higher. A SELL signal cancels that and exits at market |
+| `market-follow` | Market-buys on BUY; closes the position on SELL |
 
 ## Project structure
 
@@ -41,11 +44,14 @@ src/tradingbot/
   execution.py       execution policies: how a signal becomes orders
   alpaca_client.py   everything that talks to Alpaca: market data and orders
   main.py            command-line entry point and the live trading loop
+  backtest.py        simulated broker, backtest loop and the backtest command
 ```
 
 Each cycle, `main.py` fetches one market snapshot through `alpaca_client.py`, asks the
 strategy for BUY / SELL / HOLD, and passes the signal to the execution policy. Strategies
-never touch the network, so a backtester can feed them historical candles unchanged.
+never touch the network, and execution policies talk to a small `Broker` interface. That
+lets `backtest.py` run the exact same strategy and execution code against historical
+candles, with a simulated broker in place of Alpaca.
 
 ## Setup
 
@@ -82,29 +88,53 @@ any other URL unless `ALLOW_LIVE_TRADING=true` is set.
 
 ```bash
 tradingbot --strategy stochrsi --symbol SPY
-tradingbot --strategy bbands --symbol BTC/USD
+tradingbot --strategy bbands --symbol AAPL --execution market-follow
 tradingbot --strategy stochrsi-rebound --symbol SPY --execution scalp
 tradingbot --help
 ```
 
-Options include `--qty` (units per order, default 1), `--interval` (seconds between
-cycles, default 10) and `--seed-qty N` (opt-in: market-buy N units at startup, which
-gives `scalp` some shares to sell).
+It only trades during regular market hours (9:30–16:00 New York). If you start it
+outside those hours, it just waits for the open.
 
-The three original 2022 scripts correspond roughly to:
+Other options: `--qty` (shares per order, default 1), `--interval` (seconds between
+checks, default 10) and `--seed-qty N` (buy N shares at startup; off by default).
+
+The original 2022 scripts correspond roughly to:
 
 | 2022 script | Command |
 |---|---|
 | `_stock_trader.py` | `tradingbot --strategy stochrsi --symbol SPY --execution limit-follow` |
 | `alternate_stock_trader.py` | `tradingbot --strategy stochrsi-rebound --symbol SPY --execution scalp` |
-| `crypto_trader.py` | `tradingbot --strategy bbands --symbol BTC/USD --execution market-follow` |
 
 Stop with `Ctrl+C`.
 
+## Backtesting
+
+```bash
+tradingbot-backtest --strategy stochrsi --symbol SPY --start 2026-09-01 --end 2026-09-30
+tradingbot-backtest --strategy bbands --symbol AAPL --start 2026-10-01 --fills-csv fills.csv
+```
+
+It takes the same options as the live bot, plus `--start`/`--end`, `--cash` (default
+100,000), `--spread-bps` (assumed bid/ask spread, default 2), `--fee-bps` (default 0)
+and `--fills-csv` to save every trade to a file. The report shows the P&L, what you'd
+have made just holding the stock, max drawdown, number of trades, and how much of the
+time it was in a position.
+
+Some notes on how it works:
+
+- It runs the same strategy and executor code as the live bot; only the broker is
+  swapped for a simulated one.
+- Each decision is made at the open of a 1-minute bar using only the candles before
+  it, so it can't peek ahead.
+- Orders fill at the open plus half the assumed spread. Limit orders only fill if the
+  price trades through the limit, not if it just touches it.
+- Like the live bot, it only trades regular market hours.
+
+It doesn't model partial fills or latency, so treat the numbers as rough.
+
 ## Roadmap
 
-- **Backtester**: replay historical candles through the same `Strategy` interface to
-  measure results before running anything live
 - **Tests**: unit tests for indicators, strategies (especially the StochRSI state
   machine) and execution policies against a fake broker
 - **CI**: GitHub Actions running lint and tests on every push
